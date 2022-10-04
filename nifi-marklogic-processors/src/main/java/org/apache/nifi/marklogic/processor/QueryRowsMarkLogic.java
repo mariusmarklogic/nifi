@@ -48,6 +48,10 @@ public class QueryRowsMarkLogic extends AbstractMarkLogicProcessor {
 
 	protected static final Relationship SUCCESS = new Relationship.Builder().name("success")
 		.description("A FlowFile is routed here with its content being that exported rows").build();
+		
+	protected static final Relationship ORIGINAL = new Relationship.Builder().name("original")
+        .autoTerminateDefault(true)
+            .description("If this processor receives a FlowFile, it will be routed to this relationship").build();
 
 	@Override
 	public void init(ProcessorInitializationContext context) {
@@ -60,21 +64,25 @@ public class QueryRowsMarkLogic extends AbstractMarkLogicProcessor {
 		Set<Relationship> set = new HashSet<>();
 		set.add(FAILURE);
 		set.add(SUCCESS);
+		set.add(ORIGINAL);
 		relationships = Collections.unmodifiableSet(set);
 	}
 
 	@Override
 	public void onTrigger(ProcessContext context, ProcessSessionFactory sessionFactory) throws ProcessException {
 		final ProcessSession session = sessionFactory.createSession();
-
+		FlowFile flowFile = session.get();
+		FlowFile incomingFlowFile = flowFile;
 		try {
-			FlowFile flowFile = session.get();
+			
 			if (flowFile == null) {
 				flowFile = session.create();
 			}
 
 			final String jsonPlan = determineJsonPlan(context, flowFile);
 			final String mimeType = determineMimeType(context, flowFile);
+
+			session.putAttribute(flowFile, "marklogic-optic-plan", determineJsonPlan(context, flowFile));
 
 			final DatabaseClient client = getDatabaseClient(context);
 			final RowManager rowManager = client.newRowManager();
@@ -83,17 +91,30 @@ public class QueryRowsMarkLogic extends AbstractMarkLogicProcessor {
 			InputStream inputStream = rowManager.resultDoc(plan, new InputStreamHandle().withMimetype(mimeType)).get();
 			if (inputStream != null) {
 				try {
-					flowFile = session.write(flowFile, out -> {
-						FileCopyUtils.copy(inputStream, out);
-					});
+					if(incomingFlowFile != null) {
+						incomingFlowFile = session.write(flowFile, out -> {
+							FileCopyUtils.copy(inputStream, out);
+						});
+					} else {
+						flowFile = session.write(flowFile, out -> {
+							FileCopyUtils.copy(inputStream, out);
+						});
+					}
 				} finally {
 					inputStream.close();
 				}
 			}
+			if(incomingFlowFile != null) {
+				transferAndCommit(session, incomingFlowFile, SUCCESS);
+			}
+
+			if (flowFile != null) {
+                transferAndCommit(session, flowFile, ORIGINAL);
+            }
 			
-			transferAndCommit(session, flowFile, SUCCESS);
 		} catch (final Throwable t) {
-			this.logErrorAndRollbackSession(t, session);
+			// getLogger().error("markLogicErrorMessage", new Object[] { this }, t);
+			logErrorAndTransfer(t, flowFile, session, FAILURE);
 		}
 	}
 
